@@ -1,6 +1,6 @@
 import 'array-flat-polyfill';
 import { LitElement, html, TemplateResult, PropertyValues, CSSResultGroup } from 'lit';
-import { property, customElement, eventOptions } from 'lit/decorators.js';
+import { property, customElement, state, eventOptions } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { ClassInfo, classMap } from 'lit/directives/class-map.js';
 import {
@@ -128,6 +128,9 @@ class ChartsCard extends LitElement {
   private _apexBrush?: ApexCharts;
 
   private _loaded = false;
+
+  @state() // <-- Use @state decorator for internal reactive state
+  private _seriesVisibility: boolean[] = [];
 
   @property({ type: Boolean }) private _updating = false;
 
@@ -499,59 +502,169 @@ class ChartsCard extends LitElement {
     } catch (e: any) {
       throw new Error(`/// apexcharts-card version ${pjson.version} /// ${e.message}`);
     }
+    if(this._config) {
+      this._seriesVisibility = this._config.series_in_graph.map(
+          (serie) => !serie.show?.hidden_by_default // Initialize visibility (true if not hidden by default)
+      );
+
+      // Add or update the legendClick handler in the apex_config
+      const legendClickCallback = (_chartContext, seriesIndex, _config) => {
+        this._handleLegendClick(seriesIndex);
+      };
+
+      if (!this._config.apex_config) {
+          this._config.apex_config = {};
+      }
+      if (!this._config.apex_config.chart) {
+          this._config.apex_config.chart = {};
+      }
+       if (!this._config.apex_config.chart.events) {
+          this._config.apex_config.chart.events = {};
+      }
+      this._config.apex_config.chart.events.legendClick = legendClickCallback;
+
+      // Do the same for the brush config if it exists
+      if (this._config.experimental?.brush && this._config.brush) {
+           if (!this._config.brush.apex_config) {
+               this._config.brush.apex_config = {};
+           }
+           if (!this._config.brush.apex_config.chart) {
+               this._config.brush.apex_config.chart = {};
+           }
+           if (!this._config.brush.apex_config.chart.events) {
+               this._config.brush.apex_config.chart.events = {};
+           }
+           // Brush legend is usually hidden, but add handler just in case config changes
+           this._config.brush.apex_config.chart.events.legendClick = legendClickCallback;
+      }
+
+  }
     // Full reset only happens in editor mode
     this._reset();
   }
 
+  private _handleLegendClick(seriesIndex: number): void {
+    if (this._seriesVisibility && this._seriesVisibility[seriesIndex] !== undefined) {
+      // Toggle the state
+      this._seriesVisibility[seriesIndex] = !this._seriesVisibility[seriesIndex];
+      // Trigger an update specifically for recalculating axis scale
+      // No need to fetch all data again, just recalculate min/max and update options
+      this._updateAxisMinMax();
+    }
+  }
+
+  // Specifically update axes after visibility change
+  private _updateAxisMinMax(): void {
+    if (!this._config || !this._apexChart || !this._graphs) return;
+
+    const { start, end } = this._getSpanDates();
+    const yaxisConfig = this._computeYAxisAutoMinMax(start, end); // Recalculate using new visibility state
+
+    if (yaxisConfig) {
+         this._apexChart.updateOptions(
+             { yaxis: yaxisConfig },
+             false, // no animation
+             false, // no redraw (ApexCharts might redraw axis anyway)
+             true // keep existing annotations
+         ).catch(err => console.error("Apexcharts-card: Error updating axes", err));
+    }
+}
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private _generateYAxisConfig(config: ChartCardConfig): ApexYAxis[] | undefined {
     if (!config.yaxis) return undefined;
-    const burned: boolean[] = [];
-    this._yAxisConfig = JSON.parse(JSON.stringify(config.yaxis));
-    const yaxisConfig: ApexYAxis[] = config.series_in_graph.map((serie, serieIndex) => {
-      let idx = -1;
-      if (config.yaxis?.length !== 1) {
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        idx = config.yaxis!.findIndex((yaxis) => {
-          return yaxis.id === serie.yaxis_id;
-        });
+
+    // Reset or initialize the internal detailed yAxis config including series associations
+    this._yAxisConfig = config.yaxis.map((axisConf) => ({
+      ...JSON.parse(JSON.stringify(axisConf)), // Deep copy original config
+      series_id: [], // Initialize series_id array
+    }));
+
+    // Create a map to easily find the index in _yAxisConfig based on yaxis.id
+    const yAxisIndexMap: Map<string | undefined, number> = new Map();
+    this._yAxisConfig.forEach((axis, index) => {
+      yAxisIndexMap.set(axis.id, index);
+    });
+
+    // Associate series indices with their respective Y-axis configurations
+    config.series_in_graph.forEach((serie, serieIndex) => {
+      let axisIndex: number | undefined;
+      if (config.yaxis?.length === 1) {
+        // If only one y-axis defined, all series map to it (index 0)
+        axisIndex = 0;
+      } else if (serie.yaxis_id) {
+        // Find the index of the y-axis config matching the series' yaxis_id
+        axisIndex = yAxisIndexMap.get(serie.yaxis_id);
       } else {
-        idx = 0;
+        // If multiple axes defined but series has no yaxis_id, throw error
+        throw new Error(
+          `Multiple yaxis detected: Series '${serie.name || serie.entity}' is missing the 'yaxis_id' configuration.`,
+        );
       }
-      if (idx < 0) {
-        throw new Error(`yaxis_id: ${serie.yaxis_id} doesn't exist.`);
+
+      if (axisIndex === undefined) {
+        throw new Error(`yaxis_id: '${serie.yaxis_id}' specified for series '${serie.name || serie.entity}' doesn't exist in the yaxis configuration.`);
       }
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion, @typescript-eslint/no-explicit-any
-      let yAxisDup: any = JSON.parse(JSON.stringify(config.yaxis![idx]));
-      delete yAxisDup.apex_config;
-      delete yAxisDup.decimals;
-      yAxisDup.decimalsInFloat =
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        config.yaxis![idx].decimals === undefined ? DEFAULT_FLOAT_PRECISION : config.yaxis![idx].decimals;
-      if (this._yAxisConfig?.[idx].series_id) {
-        this._yAxisConfig?.[idx].series_id?.push(serieIndex);
-      } else {
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        this._yAxisConfig![idx].series_id! = [serieIndex];
-      }
+
+      // Add the series index to the correct y-axis configuration
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      if (config.yaxis![idx].apex_config) {
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        yAxisDup = mergeDeep(yAxisDup, config.yaxis![idx].apex_config);
-        delete yAxisDup.apex_config;
+      this._yAxisConfig![axisIndex].series_id!.push(serieIndex);
+    });
+
+
+    // Generate the final ApexYAxis configuration array
+    const apexYaxisConfig: ApexYAxis[] = this._yAxisConfig.map((yAxisConf) => {
+      // Start with a clean copy of the axis config from the user, excluding fields we manage separately
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const yAxisDup: any = JSON.parse(JSON.stringify(yAxisConf));
+      delete yAxisDup.id; // Apex doesn't use 'id' in the final config this way
+      delete yAxisDup.series_id; // Internal mapping, not for Apex
+      delete yAxisDup.apex_config; // Merge apex_config below
+      delete yAxisDup.decimals; // Use decimalsInFloat
+      delete yAxisDup.min_type; // Internal mapping
+      delete yAxisDup.max_type; // Internal mapping
+
+      // Set show property based directly on user config (defaulting to true)
+      yAxisDup.show = yAxisConf.show === undefined ? true : yAxisConf.show;
+
+      // Set decimals for float formatting
+      yAxisDup.decimalsInFloat =
+        yAxisConf.decimals === undefined ? DEFAULT_FLOAT_PRECISION : yAxisConf.decimals;
+
+      // Merge any specific ApexJS configurations provided by the user
+      if (yAxisConf.apex_config) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        mergeDeep(yAxisDup, yAxisConf.apex_config);
       }
-      if (typeof yAxisDup.min !== 'number') delete yAxisDup.min;
-      if (typeof yAxisDup.max !== 'number') delete yAxisDup.max;
-      if (burned[idx]) {
-        yAxisDup.show = false;
+
+      // Only include min/max if they are fixed numbers (type FIXED)
+      // Auto/Soft/Absolute min/max are handled dynamically later in _computeYAxisAutoMinMax
+      const [minVal, minType] = this._getTypeOfMinMax(yAxisConf.min);
+      const [maxVal, maxType] = this._getTypeOfMinMax(yAxisConf.max);
+
+      if (minType === minmax_type.FIXED) {
+        yAxisDup.min = minVal;
       } else {
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        yAxisDup.show = config.yaxis![idx].show === undefined ? true : config.yaxis![idx].show;
-        burned[idx] = true;
+         delete yAxisDup.min; // Ensure non-fixed min is not sent initially
       }
+      if (maxType === minmax_type.FIXED) {
+        yAxisDup.max = maxVal;
+      } else {
+         delete yAxisDup.max; // Ensure non-fixed max is not sent initially
+      }
+
+
       return yAxisDup;
     });
-    return yaxisConfig;
+
+
+    // Store the detailed config (including series_id mapping) for later use in min/max calculations
+    this._yAxisConfig?.forEach((yaxis) => {
+            [yaxis.min, yaxis.min_type] = this._getTypeOfMinMax(yaxis.min);
+            [yaxis.max, yaxis.max_type] = this._getTypeOfMinMax(yaxis.max);
+     });
+
+    return apexYaxisConfig;
   }
 
   static get styles(): CSSResultGroup {
@@ -1178,80 +1291,141 @@ class ChartsCard extends LitElement {
   }
 
   private _computeYAxisAutoMinMax(start: Date, end: Date) {
-    if (!this._config) return;
-    this._yAxisConfig?.map((yaxis) => {
+    // No need to check this._apexChart here anymore for visibility state
+    if (!this._config || !this._yAxisConfig || !this._graphs) return undefined;
+
+    let updatedApexYAxisConfig: ApexYAxis[] | undefined;
+    if (this._config.apex_config?.yaxis && Array.isArray(this._config.apex_config.yaxis)) {
+        updatedApexYAxisConfig = JSON.parse(JSON.stringify(this._config.apex_config.yaxis));
+    } else {
+        return this._config.apex_config?.yaxis;
+    }
+
+    // We will use this._seriesVisibility which is maintained by _handleLegendClick
+
+    this._yAxisConfig.forEach((yaxis, yaxisIndex) => {
       if (yaxis.min_type !== minmax_type.FIXED || yaxis.max_type !== minmax_type.FIXED) {
-        const minMax = yaxis.series_id?.map((id) => {
-          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-          const lMinMax = this._graphs![id]?.minMaxWithTimestampForYAxis(
-            this._seriesOffset[id] ? new Date(start.getTime() + this._seriesOffset[id]).getTime() : start.getTime(),
-            this._seriesOffset[id] ? new Date(end.getTime() + this._seriesOffset[id]).getTime() : end.getTime(),
+        
+        const seriesGraphIndices = Array.isArray(yaxis.series_id)
+           ? yaxis.series_id.map(originalSeriesIndex =>
+               // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+               this._config!.series_in_graph.findIndex(s => s.index === originalSeriesIndex)
+             ).filter(index => index !== -1)
+           : []; // Default to empty array if series_id is not an array
+
+        const minMax = seriesGraphIndices?.map((graphSeriesIndex) => {
+           // *** Use the internal state for visibility check ***
+           if (this._seriesVisibility === undefined || this._seriesVisibility[graphSeriesIndex] === false) {
+               return undefined; // Skip this series if it's hidden according to our state
+           }
+           // *** End of change ***
+
+           // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+           const seriesConfig = this._config!.series_in_graph[graphSeriesIndex];
+           if (!seriesConfig) {
+               // This check ensures seriesConfig is valid before proceeding
+               return undefined;
+           }
+
+           // Now it's safe to access .index because seriesConfig is guaranteed to be defined here
+           const originalSeriesIndex = seriesConfig.index;
+
+           let potentialGraph: GraphEntry | undefined = undefined;
+           if (this._graphs) {
+               potentialGraph = this._graphs[originalSeriesIndex]; // Access might yield undefined
+           }
+
+           // Check if the retrieved value is usable
+           if (!potentialGraph) {
+               return undefined;
+           }
+
+           // Now potentialGraph is narrowed to GraphEntry
+           const graph: GraphEntry = potentialGraph;
+
+          // ... (rest of the min/max calculation for the series remains the same) ...
+           const lMinMax = graph!.minMaxWithTimestampForYAxis(
+            this._seriesOffset[originalSeriesIndex] ? new Date(start.getTime() + this._seriesOffset[originalSeriesIndex]).getTime() : start.getTime(),
+            this._seriesOffset[originalSeriesIndex] ? new Date(end.getTime() + this._seriesOffset[originalSeriesIndex]).getTime() : end.getTime(),
           );
+          
           if (!lMinMax) return undefined;
-          if (this._config?.series[id].invert) {
+
+          if (this._config?.series[originalSeriesIndex].invert) {
             const cmin = lMinMax.min[1];
             const cmax = lMinMax.max[1];
-            if (cmin !== null) {
-              lMinMax.max[1] = -cmin;
-            }
-            if (cmax !== null) {
-              lMinMax.min[1] = -cmax;
-            }
+            lMinMax.max[1] = cmin !== null ? -cmin : null;
+            lMinMax.min[1] = cmax !== null ? -cmax : null;
           }
           return lMinMax;
+
         });
-        let min: number | null = null;
-        let max: number | null = null;
-        minMax?.forEach((elt) => {
-          if (!elt) return;
-          if (min === undefined || min === null) {
-            min = elt.min[1];
-          } else if (elt.min[1] !== null && min > elt.min[1]) {
-            min = elt.min[1];
-          }
-          if (max === undefined || max === null) {
-            max = elt.max[1];
-          } else if (elt.max[1] !== null && max < elt.max[1]) {
-            max = elt.max[1];
-          }
-        });
-        if (yaxis.align_to !== undefined) {
-          if (min !== null && yaxis.min_type !== minmax_type.FIXED) {
-            if (min % yaxis.align_to !== 0) {
-              min = min >= 0 ? min - (min % yaxis.align_to) : -(yaxis.align_to + (min % yaxis.align_to) - min);
+
+        // ... (rest of the function remains largely the same, calculating overall min/max
+        //      from the filtered minMax array and updating updatedApexYAxisConfig[yaxisIndex]) ...
+
+         let min: number | null = null;
+         let max: number | null = null;
+
+         minMax?.forEach((elt) => {
+            if (!elt) return;
+            if (elt.min[1] !== null && (min === null || elt.min[1] < min)) {
+                min = elt.min[1];
             }
-          }
-          if (max !== null && yaxis.max_type !== minmax_type.FIXED) {
-            if (max % yaxis.align_to !== 0) {
-              max = max >= 0 ? yaxis.align_to - (max % yaxis.align_to) + max : (max % yaxis.align_to) - max;
+            if (elt.max[1] !== null && (max === null || elt.max[1] > max)) {
+                max = elt.max[1];
             }
-          }
-        }
-        yaxis.series_id?.forEach((id) => {
-          if (min !== null && yaxis.min_type !== minmax_type.FIXED) {
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-            this._config!.apex_config!.yaxis![id].min = this._getMinMaxBasedOnType(
-              true,
-              min,
-              yaxis.min as number,
-              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-              yaxis.min_type!,
-            );
-          }
-          if (max !== null && yaxis.max_type !== minmax_type.FIXED) {
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-            this._config!.apex_config!.yaxis![id].max = this._getMinMaxBasedOnType(
-              false,
-              max,
-              yaxis.max as number,
-              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-              yaxis.max_type!,
-            );
-          }
-        });
-      }
-    });
-    return this._config?.apex_config?.yaxis;
+         });
+
+         if (yaxis.align_to !== undefined && min !== null && max !== null) {
+              if (yaxis.min_type !== minmax_type.FIXED) {
+                  const alignTo = yaxis.align_to;
+                  min = min >= 0 ? min - (min % alignTo) : min - (alignTo + (min % alignTo)) % alignTo;
+              }
+              if (yaxis.max_type !== minmax_type.FIXED) {
+                  const alignTo = yaxis.align_to;
+                  max = max >= 0 ? max + (alignTo - (max % alignTo)) % alignTo : max + (-max % alignTo);
+              }
+         }
+
+         const currentApexConfig = updatedApexYAxisConfig ? updatedApexYAxisConfig[yaxisIndex] : undefined;
+
+         if (currentApexConfig) { // This ensures currentApexConfig is not undefined
+             const calculatedMin = min === null ? (yaxis.min_type === minmax_type.FIXED ? yaxis.min as number : 0) : min;
+             const calculatedMax = max === null ? (yaxis.max_type === minmax_type.FIXED ? yaxis.max as number : 0) : max;
+
+             if (yaxis.min_type !== minmax_type.FIXED) {
+                 currentApexConfig.min = this._getMinMaxBasedOnType(
+                     true,
+                     calculatedMin,
+                     yaxis.min as number, // Assuming yaxis.min is number if type isn't FIXED/AUTO
+                     yaxis.min_type!,   // Assertion okay because type is not FIXED
+                 );
+             }
+             if (yaxis.max_type !== minmax_type.FIXED) {
+                 currentApexConfig.max = this._getMinMaxBasedOnType(
+                     false,
+                     calculatedMax,
+                     yaxis.max as number, // Assuming yaxis.max is number if type isn't FIXED/AUTO
+                     yaxis.max_type!,   // Assertion okay because type is not FIXED
+                 );
+             }
+
+             // Now safely check min/max relationship
+             if (typeof currentApexConfig.min === 'number' && typeof currentApexConfig.max === 'number') {
+                 if (currentApexConfig.min >= currentApexConfig.max) {
+                     currentApexConfig.max = currentApexConfig.min + 1;
+                 }
+             }
+         } else {
+             // Log an error if the structure is unexpectedly different
+             console.error("Apexcharts-card: Mismatch between _yAxisConfig and apex_config.yaxis during min/max calculation at index:", yaxisIndex);
+         }
+
+
+      } // end if min/max type not fixed
+    }); // end forEach yaxisConfig
+    return updatedApexYAxisConfig;
   }
 
   private _getMinMaxBasedOnType(isMin: boolean, value: number, configMinMax: number, type: minmax_type): number {
