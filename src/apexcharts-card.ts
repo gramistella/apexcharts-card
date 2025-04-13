@@ -508,7 +508,7 @@ class ChartsCard extends LitElement {
       );
 
       // Add or update the legendClick handler in the apex_config
-      const legendClickCallback = (_chartContext, seriesIndex, _config) => {
+      const legendClickCallback = (_chartContext, seriesIndex) => {
         this._handleLegendClick(seriesIndex);
       };
 
@@ -1290,84 +1290,85 @@ class ChartsCard extends LitElement {
     return {};
   }
 
-  private _computeYAxisAutoMinMax(start: Date, end: Date) {
+  private _computeYAxisAutoMinMax(start: Date, end: Date): ApexYAxis[] | undefined { // Added return type hint
     // No need to check this._apexChart here anymore for visibility state
     if (!this._config || !this._yAxisConfig || !this._graphs) return undefined;
 
     let updatedApexYAxisConfig: ApexYAxis[] | undefined;
+    // Ensure we have a valid array to work with, deep copy to avoid modifying original
     if (this._config.apex_config?.yaxis && Array.isArray(this._config.apex_config.yaxis)) {
         updatedApexYAxisConfig = JSON.parse(JSON.stringify(this._config.apex_config.yaxis));
     } else {
-        return this._config.apex_config?.yaxis;
+        // If apex_config.yaxis isn't a valid array, we can't proceed with calculations based on it.
+        // Return undefined or potentially the original config if it exists but isn't an array?
+        // Returning undefined seems safer if the structure is unexpected.
+        console.error("Apexcharts-card: Expected apex_config.yaxis to be an array for min/max calculation.");
+        return undefined;
     }
 
     // We will use this._seriesVisibility which is maintained by _handleLegendClick
 
     this._yAxisConfig.forEach((yaxis, yaxisIndex) => {
       if (yaxis.min_type !== minmax_type.FIXED || yaxis.max_type !== minmax_type.FIXED) {
-        
+
         const seriesGraphIndices = Array.isArray(yaxis.series_id)
-           ? yaxis.series_id.map(originalSeriesIndex =>
-               // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-               this._config!.series_in_graph.findIndex(s => s.index === originalSeriesIndex)
-             ).filter(index => index !== -1)
-           : []; // Default to empty array if series_id is not an array
+            ? yaxis.series_id.map(originalSeriesIndex =>
+                // Use optional chaining and nullish coalescing for safety
+                this._config?.series_in_graph.findIndex(s => s.index === originalSeriesIndex) ?? -1
+              ).filter(index => index !== -1)
+            : []; // Default to empty array if series_id is not an array
 
         const minMax = seriesGraphIndices?.map((graphSeriesIndex) => {
-           // *** Use the internal state for visibility check ***
-           if (this._seriesVisibility === undefined || this._seriesVisibility[graphSeriesIndex] === false) {
-               return undefined; // Skip this series if it's hidden according to our state
-           }
-           // *** End of change ***
+            // *** Use the internal state for visibility check ***
+            if (this._seriesVisibility === undefined || this._seriesVisibility[graphSeriesIndex] === false) {
+                return undefined; // Skip this series if it's hidden according to our state
+            }
+            // *** End of change ***
 
-           // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-           const seriesConfig = this._config!.series_in_graph[graphSeriesIndex];
-           if (!seriesConfig) {
-               // This check ensures seriesConfig is valid before proceeding
-               return undefined;
-           }
+            // Safely access series_in_graph element
+            const seriesConfig = this._config?.series_in_graph?.[graphSeriesIndex];
+            if (!seriesConfig) {
+                // This check ensures seriesConfig is valid before proceeding
+                return undefined;
+            }
 
-           // Now it's safe to access .index because seriesConfig is guaranteed to be defined here
-           const originalSeriesIndex = seriesConfig.index;
+            // Now it's safe to access .index because seriesConfig is guaranteed to be defined here
+            const originalSeriesIndex = seriesConfig.index;
 
-           let potentialGraph: GraphEntry | undefined = undefined;
-           if (this._graphs) {
-               potentialGraph = this._graphs[originalSeriesIndex]; // Access might yield undefined
-           }
+            // Safely access graphs element
+            const graph = this._graphs?.[originalSeriesIndex];
 
-           // Check if the retrieved value is usable
-           if (!potentialGraph) {
-               return undefined;
-           }
+            // Check if the retrieved value is usable
+            if (!graph) {
+                return undefined;
+            }
 
-           // Now potentialGraph is narrowed to GraphEntry
-           const graph: GraphEntry = potentialGraph;
+            // ... (rest of the min/max calculation for the series remains the same) ...
+            const lMinMax = graph.minMaxWithTimestampForYAxis(
+              this._seriesOffset[originalSeriesIndex] ? new Date(start.getTime() + this._seriesOffset[originalSeriesIndex]).getTime() : start.getTime(),
+              this._seriesOffset[originalSeriesIndex] ? new Date(end.getTime() + this._seriesOffset[originalSeriesIndex]).getTime() : end.getTime(),
+            );
 
-          // ... (rest of the min/max calculation for the series remains the same) ...
-           const lMinMax = graph!.minMaxWithTimestampForYAxis(
-            this._seriesOffset[originalSeriesIndex] ? new Date(start.getTime() + this._seriesOffset[originalSeriesIndex]).getTime() : start.getTime(),
-            this._seriesOffset[originalSeriesIndex] ? new Date(end.getTime() + this._seriesOffset[originalSeriesIndex]).getTime() : end.getTime(),
-          );
-          
-          if (!lMinMax) return undefined;
+            if (!lMinMax) return undefined;
 
-          if (this._config?.series[originalSeriesIndex].invert) {
-            const cmin = lMinMax.min[1];
-            const cmax = lMinMax.max[1];
-            lMinMax.max[1] = cmin !== null ? -cmin : null;
-            lMinMax.min[1] = cmax !== null ? -cmax : null;
-          }
-          return lMinMax;
+            // Check if series config exists before accessing invert potentially
+            if (this._config?.series?.[originalSeriesIndex]?.invert) {
+              const cmin = lMinMax.min[1];
+              const cmax = lMinMax.max[1];
+              lMinMax.max[1] = cmin !== null ? -cmin : null;
+              lMinMax.min[1] = cmax !== null ? -cmax : null;
+            }
+            return lMinMax;
 
         });
 
         // ... (rest of the function remains largely the same, calculating overall min/max
         //      from the filtered minMax array and updating updatedApexYAxisConfig[yaxisIndex]) ...
 
-         let min: number | null = null;
-         let max: number | null = null;
+          let min: number | null = null;
+          let max: number | null = null;
 
-         minMax?.forEach((elt) => {
+          minMax?.forEach((elt) => {
             if (!elt) return;
             if (elt.min[1] !== null && (min === null || elt.min[1] < min)) {
                 min = elt.min[1];
@@ -1375,9 +1376,9 @@ class ChartsCard extends LitElement {
             if (elt.max[1] !== null && (max === null || elt.max[1] > max)) {
                 max = elt.max[1];
             }
-         });
+          });
 
-         if (yaxis.align_to !== undefined && min !== null && max !== null) {
+          if (yaxis.align_to !== undefined && min !== null && max !== null) {
               if (yaxis.min_type !== minmax_type.FIXED) {
                   const alignTo = yaxis.align_to;
                   min = min >= 0 ? min - (min % alignTo) : min - (alignTo + (min % alignTo)) % alignTo;
@@ -1386,42 +1387,64 @@ class ChartsCard extends LitElement {
                   const alignTo = yaxis.align_to;
                   max = max >= 0 ? max + (alignTo - (max % alignTo)) % alignTo : max + (-max % alignTo);
               }
-         }
+          }
 
-         const currentApexConfig = updatedApexYAxisConfig ? updatedApexYAxisConfig[yaxisIndex] : undefined;
+          // Safely access the element in updatedApexYAxisConfig
+          const currentApexConfig = updatedApexYAxisConfig ? updatedApexYAxisConfig[yaxisIndex] : undefined;
 
-         if (currentApexConfig) { // This ensures currentApexConfig is not undefined
-             const calculatedMin = min === null ? (yaxis.min_type === minmax_type.FIXED ? yaxis.min as number : 0) : min;
-             const calculatedMax = max === null ? (yaxis.max_type === minmax_type.FIXED ? yaxis.max as number : 0) : max;
+          if (currentApexConfig) { // This ensures currentApexConfig is not undefined
+              // Determine calculatedMin/Max safely
+              const calculatedMin = min ?? (yaxis.min_type === minmax_type.FIXED ? yaxis.min as number : 0);
+              const calculatedMax = max ?? (yaxis.max_type === minmax_type.FIXED ? yaxis.max as number : 0);
 
-             if (yaxis.min_type !== minmax_type.FIXED) {
-                 currentApexConfig.min = this._getMinMaxBasedOnType(
-                     true,
-                     calculatedMin,
-                     yaxis.min as number, // Assuming yaxis.min is number if type isn't FIXED/AUTO
-                     yaxis.min_type!,   // Assertion okay because type is not FIXED
-                 );
-             }
-             if (yaxis.max_type !== minmax_type.FIXED) {
-                 currentApexConfig.max = this._getMinMaxBasedOnType(
-                     false,
-                     calculatedMax,
-                     yaxis.max as number, // Assuming yaxis.max is number if type isn't FIXED/AUTO
-                     yaxis.max_type!,   // Assertion okay because type is not FIXED
-                 );
-             }
+              if (yaxis.min_type !== minmax_type.FIXED) {
+                  // --- Fix for Line 1402 ---
+                  const minType = yaxis.min_type;
+                  // We know minType cannot be FIXED (0) here. If it exists (is not null/undefined), use it.
+                  if (minType !== undefined && minType !== null) {
+                      currentApexConfig.min = this._getMinMaxBasedOnType(
+                          true,
+                          calculatedMin,
+                          yaxis.min as number,
+                          minType, // No '!' needed
+                      );
+                  } else {
+                      // This case should logically not happen based on _getTypeOfMinMax
+                      console.error("Apexcharts-card: Unexpected undefined or null min_type for yaxis:", yaxis);
+                      // Optionally assign a default or leave currentApexConfig.min untouched
+                  }
+                  // --- End Fix ---
+              }
+              if (yaxis.max_type !== minmax_type.FIXED) {
+                   // --- Fix for Line 1410 ---
+                   const maxType = yaxis.max_type;
+                   // We know maxType cannot be FIXED (0) here. If it exists (is not null/undefined), use it.
+                   if (maxType !== undefined && maxType !== null) {
+                       currentApexConfig.max = this._getMinMaxBasedOnType(
+                           false,
+                           calculatedMax,
+                           yaxis.max as number,
+                           maxType, // No '!' needed
+                       );
+                   } else {
+                       // This case should logically not happen based on _getTypeOfMinMax
+                       console.error("Apexcharts-card: Unexpected undefined or null max_type for yaxis:", yaxis);
+                       // Optionally assign a default or leave currentApexConfig.max untouched
+                   }
+                   // --- End Fix ---
+              }
 
-             // Now safely check min/max relationship
-             if (typeof currentApexConfig.min === 'number' && typeof currentApexConfig.max === 'number') {
-                 if (currentApexConfig.min >= currentApexConfig.max) {
-                     currentApexConfig.max = currentApexConfig.min + 1;
-                 }
-             }
-         } else {
-             // Log an error if the structure is unexpectedly different
-             console.error("Apexcharts-card: Mismatch between _yAxisConfig and apex_config.yaxis during min/max calculation at index:", yaxisIndex);
-         }
-
+              // Now safely check min/max relationship
+              if (typeof currentApexConfig.min === 'number' && typeof currentApexConfig.max === 'number') {
+                  if (currentApexConfig.min >= currentApexConfig.max) {
+                      // Add a small buffer if min equals or exceeds max
+                      currentApexConfig.max = currentApexConfig.min + 1;
+                  }
+              }
+          } else {
+              // Log an error if the structure is unexpectedly different
+              console.error("Apexcharts-card: Mismatch between _yAxisConfig and calculated updatedApexYAxisConfig at index:", yaxisIndex);
+          }
 
       } // end if min/max type not fixed
     }); // end forEach yaxisConfig
